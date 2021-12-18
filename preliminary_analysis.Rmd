@@ -1,0 +1,516 @@
+---
+title: "Preliminary Data Analysis"
+author: "Leonardo Torres"
+subtitle: "Master's Capstone Project - Fall 2021"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.align = "left")
+library(tidyverse)
+library(tidycensus)
+library(sf)
+library(ggplot2)
+library(tidymodels)
+library(tidyquant)
+library(randomForest)
+library(ranger)
+library(vip)
+library(DALEXtra)
+library(knitr)
+```
+
+```{r import data, include=FALSE}
+#precovid data
+precovid_tripcounts <- read_csv('processed_data/precovid_tripcounts.csv', col_select = c(2:5), col_types = cols(.default = 'd', GEOID = 'c'))
+precovid_stats <- read_csv('processed_data/precovid_stats.csv', col_select = c(2:5), col_types = cols(.default = 'd', GEOID = 'c'))
+
+#postcovid data
+postcovid_tripcounts <- read_csv('processed_data/postcovid_tripcounts.csv', col_select = c(2:5), col_types = cols(.default = 'd', GEOID = 'c'))
+postcovid_stats <- read_csv('processed_data/postcovid_stats.csv', col_select = c(2:5), col_types = cols(.default = 'd', GEOID = 'c'))
+
+#trips time series
+trips_ts <- read_csv('processed_data/trips_timeseries.csv', col_select = c(2:3))
+
+#predictor features
+pred_feat <- read_csv('auxdata/acs2015_2019.csv', col_types = cols(.default = 'd', GEOID = 'c'))
+
+#tracts shape file for mapping
+tracts <- st_read('auxdata/tracts.shp') %>% 
+  rename(GEOID = geoid10) %>% 
+  select(GEOID, geometry)
+```
+
+```{r create model data, include=FALSE}
+#precovid data
+precovid <- precovid_tripcounts %>% 
+  inner_join(precovid_stats, by='GEOID') %>% 
+  inner_join(pred_feat, by='GEOID') %>% 
+  inner_join(tracts, by='GEOID') %>% 
+  drop_na() %>% 
+  select(-pickup_tripcount, -dropoff_tripcount, -totalpop)
+
+#postcovid data
+postcovid <- postcovid_tripcounts %>% 
+  inner_join(postcovid_stats, by='GEOID') %>% 
+  inner_join(pred_feat, by='GEOID') %>% 
+  inner_join(tracts, by='GEOID') %>% 
+  drop_na() %>% 
+  select(-pickup_tripcount, -dropoff_tripcount, -totalpop)
+```
+
+```{r}
+#ggplot theme 
+theme_map <- function(...) {
+  theme_minimal() +
+    theme(
+      text = element_text(family = "IBM Plex Sans", color = "#22211d"),
+      axis.line = element_blank(),
+      axis.text.x = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks = element_blank(),
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank(),
+      panel.grid.minor = element_line(color = "#ebebe5", size = 0.2),
+      panel.grid.major = element_line(color = "#ebebe5", size = 0.2),
+      plot.background = element_rect(fill = "#FFFFFF", color = NA), 
+      panel.background = element_rect(fill = "#FFFFFF", color = NA), 
+      legend.background = element_rect(fill = "#FFFFFF", color = NA),
+      panel.border = element_blank(),
+      ...
+    )
+}
+
+theme_plex <- function(base_size = 11,
+                       strip_text_size = 12,
+                       strip_text_margin = 5,
+                       subtitle_size = 13,
+                       subtitle_margin = 10,
+                       plot_title_size = 16,
+                       plot_title_margin = 10,
+                       ...) {
+    ret <- ggplot2::theme_minimal(base_family = "IBM Plex Sans",
+                                  base_size = base_size, ...)
+    ret$strip.text <- ggplot2::element_text(
+        hjust = 0, size = strip_text_size,
+        margin = ggplot2::margin(b = strip_text_margin),
+        family = "IBM Plex Sans Medium"
+    )
+    ret$plot.subtitle <- ggplot2::element_text(
+        hjust = 0, size = subtitle_size,
+        margin = ggplot2::margin(b = subtitle_margin),
+        family = "IBM Plex Sans"
+    )
+    ret$plot.title <- ggplot2::element_text(
+        hjust = 0, size = plot_title_size,
+        margin = ggplot2::margin(b = plot_title_margin),
+        family = "IBM Plex Sans Bold"
+    )
+    ret
+}
+```
+
+
+## Introduction
+
+The impact of COVID-19 on cities is undeniable. As businesses closed, companies moved to remote work, and lockdown restrictions were implemented, urban areas around the world became noticeably less active. Highways were free of rush hour traffic, while public transit struggled to maintain demand. Conventional travel behavior notions were thrown out the window as novel transportation patterns emerged. Transportation Network Companies (TNC), also known as rideshare companies, were particularly impacted by these abrupt changes. Given the importance of ridehailing in a 21st century transportation system, understanding the impact of the pandemic on different transport modes is increasingly critical for cities across the country. This project attempts to understand the impact of COVID on TNC services in the City of Chicago using a machine learning (ML) approach. There's two main goals of this project: 
+
+1. Assess the accuracy of multiple ML algorithms in predicting TNC demand
+2. Utilize the interpretability of tree-based ML algorithms to gauge how TNC service usage changed across different socioeconomic and demographic groups in Chicago
+
+Tree-based ML algorithms are one type of non-parametric regressions which are able to identify complex relationships without previous assumptions about inputs-outputs -- something that parametric models lack. In short, tree-based models generate predictions from a series of if-then rules (decisions). A more in-depth explanation and discussion of these models, and their advantages-disadvantages, will be included in the final report of this capstone project.
+
+## Data Sources
+
+### TNC Trips
+With the increasing availability of open-source big data, transportation planners and data analysts are able to gain a comprehensive understanding of their rideshare system and the repercussions of COVID-19. This project attempts to do this using the City of Chicago's [Transportation Network Providers - Trips](https://data.cityofchicago.org/Transportation/Transportation-Network-Providers-Trips/m6dm-c72p) dataset. The raw dataset contains 221 million rows, each representing a rideshare trip taken within Chicago's boundary. Each row contains various trip attributes, such start and end timestamps, trip length, total trip fare, whether the trip was pooled, and the census tract where the trip started and ended. For practical purposes, we are going to use a subset of the data for this project. Specifically, we will be looking at TNC trips taken five months before and five months after the day that the World Health Organization (WHO) declared the spread of the SARS-CoV-2 virus a worldwide pandemic: March 11, 2020. Thus, the data will be split in two parts: 
+
+1. Pre-Covid Trips: trips taken between October 11,2019 - March 10, 2020
+2. Post-Covid Trips: trips taken between March 11, 2020 - August 10, 2020
+
+### American Community Survey 2015-2019
+This project utilizes the latest socioeconomic and demographic data for Chicago using the American Community Survey (ACS), which collects such data at the census tract level. The census tract is an arbitrary boundary created by the U.S. Census Bureau and is often treated by social scientists as a proxy for neighborhoods. To see how census tracts relate to other geographic boundaries, like counties or cities, you can refer to the [Standard Hierarchy of Census Geographic Entities](https://www2.census.gov/geo/pdfs/reference/geodiagram.pdf) diagram. Survey responses are aggregated by the Census Bureau and provide ‘neighborhood level’ data on race, ethnicity, poverty, home values, income, etc. For this project, we'll collect this data programmatically using the [tidycensus](https://walker-data.com/tidycensus/) R package, write the data to a csv file, and import it into this notebook.
+
+### Longitudinal Employer-Household Dynamics
+
+[data collection in progress]
+
+### General Transit Feed Specification (GTFS)
+
+[data collection in progress]
+
+## Exploratory Data Analysis
+1. How many trips took place throughout these two time periods?
+
+```{r}
+print(paste0("Total trips 5 mo. *before* COVID: ", prettyNum(sum(precovid$totaltrips), big.mark = ',')))
+print(paste0("Total trips 5 mo. *after* COVID: ", prettyNum(sum(postcovid$totaltrips), big.mark = ',')))
+```
+
+There appears to have been an 87% decrease in total TNC trips since COVID hit.  
+
+
+2. What is the average tract-level TNC trips before and after COVID?
+
+```{r}
+print(paste0("Average tract-level trips 5 mo. *before* COVID: ", prettyNum(mean(precovid$totaltrips), big.mark = ',')))
+print(paste0("Average tract-level trips 5 mo. *after* COVID: ", prettyNum(mean(postcovid$totaltrips), big.mark = ',')))
+```
+
+On average, before COVID, there were almost 8 times more TNC trips at the tract level compared to after COVID.  
+
+3. What was the average trip time before and after COVID?
+
+```{r}
+print(paste0("Average trip time 5 mo. *before* COVID (mins): ", prettyNum(mean(precovid$avgtriptime_secs)/60, big.mark = ',')))
+print(paste0("Average trip time 5 mo. *after* COVID (mins): ", prettyNum(mean(postcovid$avgtriptime_secs)/60, big.mark = ',')))
+```
+
+The average TNC trip took only 1 minute less after COVID than before. This could be due to a lack of congestion as a result of many companies moving work remotely.  
+
+4. What was the average trip length before and after COVID?
+
+```{r}
+print(paste0("Average trip length 5 mo. *before* COVID (miles): ", prettyNum(mean(precovid$avgtripdistance_mi), big.mark = ',')))
+print(paste0("Average trip length 5 mo. *after* COVID (miles): ", prettyNum(mean(postcovid$avgtripdistance_mi), big.mark = ',')))
+```
+
+The average trip length also fell by about a mile after COVID. Aligns with the decrease in trip time.   
+
+5. What was the average trip fare before and after COVID? 
+
+```{r}
+print(paste0("Average trip fare 5 mo. *before* COVID ($): ", prettyNum(mean(precovid$avgtripfare), big.mark = ',')))
+print(paste0("Average trip fare 5 mo. *after* COVID ($): ", prettyNum(mean(postcovid$avgtripfare), big.mark = ',')))
+```
+
+So, while the average trip length and time decreased by about one unit after COVID, the trip fare actually increased by over a dollar. Trip fare variable includes additional charges like taxes and tips, so it could be due to an increase in both (ie. people could have become more generous after COVID).  
+
+6. How many daily trips were taken throughout the 10 month study period (30-day rolling average)? 
+
+```{r}
+ggplot(data=trips_ts, aes(x=day, y=tripcount)) +
+  geom_ma(ma_fun = SMA, n=30, linetype='solid', color='#F8766D', size=1.3) +
+  theme_plex() + 
+  geom_vline(xintercept = as.numeric(as.Date("2020-03-11")), linetype='dashed', color='#00BFC4', size=1.2) +
+  scale_y_continuous(labels = comma, limits = c(0,350000)) +
+  labs(title = 'Daily TNC Trips in Chicago (Oct 2019 - Aug 2020)',
+       x = 'Date',
+       y = '# of Trips')
+```
+<br>
+The green line represents March 11, 2020, the day of the WHO declaration of a global pandemic. We can see a sharp decline in the number of trips since that day, reaching below 50,000 daily trips in the city at its lowest in April.  
+
+7. Because we have total trips before and after COVID (and each time period is of equal length), we can calculate the percent change in the number of trips by tract and see if there is any correlation with poverty rate, household income, race, etc. Below we plot the correlation between the percent change in # of trips and the poverty rate.
+
+```{r}
+precovid %>% 
+  select(GEOID, totaltrips_pre = totaltrips) %>% 
+  inner_join(postcovid %>% select(GEOID, totaltrips_post = totaltrips, poverty_rate), by='GEOID') %>% 
+  mutate(p_change = (totaltrips_post - totaltrips_pre) / totaltrips_pre) %>% 
+  ggplot(aes(x=poverty_rate, y=p_change)) +
+  geom_point(alpha = 0.4, color = '#808080') + 
+  geom_smooth(method = 'loess', color = '#F8766D', se = FALSE, size=1.3) + 
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(labels = scales::percent) +
+  theme_plex() +
+  labs(title = 'Percent Change in TNC Trips and Poverty Rate',
+       subtitle = '% change relative to pre-COVID trips',
+       x = 'Poverty Rate',
+       y = 'Change in TNC Trips')
+```
+<br>
+There's an observable positive correlation between the poverty rate and the percent change in TNC trips. As the poverty rate goes up, the percent change in TNC trips relative to pre-COVID levels **decreases**; meaning that neighborhoods with higher poverty rates relied more on TNC services than wealthier ones. This aligns with Brown and Williams (2021)[^1], whose research found that higher-income areas in California exhibited a larger decline in Uber trips than others. Given that wealthier neighborhoods often have high educational attainment levels, access to occupations that can be done from home increases (thus, a decline in commuting). However, the local regression line indicates that there does appear to be a threshold in poverty where this idea no longer applies. We'll have to consider this (and other) non-linear relationships when building the ML models.  
+
+[^1]: Brown, A., & Williams, R. (2021). Equity Implications of Ride-Hail Travel during COVID-19 in California. Transportation Research Record.
+https: //doi.org/10.1177/03611981211037246
+
+8. What about demographics? Let's look at the percent change in TNC trips and the proportion of the Black population. 
+
+```{r}
+precovid %>% 
+  select(GEOID, totaltrips_pre = totaltrips) %>% 
+  inner_join(postcovid %>% select(GEOID, totaltrips_post = totaltrips, pBlack), by='GEOID') %>% 
+  mutate(p_change = (totaltrips_post - totaltrips_pre) / totaltrips_pre) %>% 
+  ggplot(aes(x=pBlack, y=p_change)) +
+  geom_point(alpha = 0.4, color = '#808080') + 
+  geom_smooth(method = 'loess', color = '#C77CFF', se = FALSE, size=1.3) + 
+  scale_y_continuous(labels = scales::percent) +
+  scale_x_continuous(labels = scales::percent) +
+  theme_plex() +
+  labs(title = 'Percent Change in TNC Trips and Black Population',
+       subtitle = '% change relative to pre-COVID trips',
+       x = 'Proportion of Black Population',
+       y = 'Change in TNC Trips')
+```
+<br>
+Not only can we see the stark segregation patterns in Chicago with this chart, we can see that tracts which had a higher proportion of Black residents relied more on TNC services. Given conventional knowledge on spatial demographic patterns in Chicago, we can presume that areas on the South and West side of the city relied on TNC services more than the wealthier, whiter North side. Let's look at spatial distributions of TNC service changes between the two time periods.  
+
+9. What does the percent change in TNC trips look like spatially? 
+```{r, fig.height=6, fig.width=4}
+precovid %>% 
+  select(GEOID, totaltrips_pre = totaltrips) %>% 
+  inner_join(postcovid %>% select(GEOID, totaltrips_post = totaltrips, geometry), by='GEOID') %>% 
+  mutate(p_change = (totaltrips_post - totaltrips_pre) / totaltrips_pre) %>% 
+  st_as_sf() %>% 
+  ggplot() +
+  geom_sf(aes(fill=p_change), lwd=0) +
+  theme_map() + 
+  scale_fill_gradientn(colours = viridis::plasma(5),
+                       breaks = scales::breaks_pretty(n=5),
+                       labels = scales::percent_format(),
+                       guide = guide_legend(
+                         direction = "horizontal",
+                         title.position = "top",
+                         keywidth = unit(12, units = "mm"),
+                         keyheight = unit(4, units = "mm"),
+                         label.position = "bottom",
+                         byrow = T,
+                         nrow = 1
+                       )
+  ) + 
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5)) + 
+  labs(title = "Percent Change in TNC Trips",
+       subtitle = "Relative to Pre-COVID",
+       caption = "Source: Chicago Open Data Portal")
+```
+<br>
+As expected, we can see that neighborhoods on the South and West side of the city had a lower decrease in the percent change of TNC usage compared to other neighborhoods.Given that spatial patterns of socioeconomic characteristics (like income, property values, educational attainment, etc.) generally follow the same patterns as above, we can hypothesize that socioeconomic and demographic variables that we include as predictors in our model will be highly important in predicting TNC trips for both the pre-COVID and post-COVID datasets.  
+
+## Model Training
+
+[explain the tidymodels package used for this project]
+
+### Random Forest
+
+[explain what random forest is]
+
+First, let's look at the distribution of our target feature. 
+```{r}
+options(scipen = 999)
+ggplot(data = precovid, aes(x=totaltrips)) + 
+  geom_density(alpha=0.2, fill='#00BFC4') + 
+  theme_plex() + 
+  scale_x_continuous(labels = scales::comma_format()) + 
+  labs(title="Distribution of Total TNC Trips",
+       x = "Trips")
+```
+<br>
+The target feature for our model is highly right-skewed. Previous research on tree-based models have shown that predictive performance, in the face of a highly skewed target feature, are severely degraded. For this reason, we will log-transform the target feature before data processing. 
+
+```{r, echo=TRUE}
+precovid <- precovid %>% 
+  mutate(totaltrips = log10(totaltrips)) %>% #log10 of target feature
+  select(-geometry) #get rid of geometry col
+```
+
+Let's check the distribution of the log-transformed target feature. 
+```{r}
+ggplot(data = precovid, aes(x=totaltrips)) + 
+  geom_density(alpha=0.2, fill='#00BFC4') + 
+  theme_plex() + 
+  labs(title="Distribution of Log-Transformed Total TNC Trips",
+       x = "Trips")
+```
+Now, that the target feature represents a more normal distribution, we're going to split the data into the training set and test set. The training set will be used to train the Random Forest model, and we'll test its performance against the test set (data that the model has not seen yet). 
+```{r, echo=TRUE}
+set.seed(4595) #for reproducibility
+precov_split <- initial_split(precovid, strata = "totaltrips", prop = 3/4) # 75% training, 25% testing
+precovid_train <- training(precov_split) #train
+precovid_test <- testing(precov_split) #test
+```
+
+Now, we have to create our recipe. A recipe is basically a unified interface for feature engineering and data preprocessing. We can easily transform, scale, and center the data for the model in fewer lines than we would normally do so with recipes.
+```{r, echo=TRUE}
+precovid_recipe <-
+  recipe(totaltrips ~ ., data = precovid_train) %>% 
+  update_role(GEOID, new_role = "id var") %>% 
+  step_corr(all_predictors()) %>% #removes vars with large absolute correlations
+  step_center(all_predictors()) %>% #normalizes predictors to have a mean of zero
+  step_scale(all_predictors()) %>% #normalizes predictors to have a standard deviation of 1
+  prep(strings_as_factors = FALSE) #estimates required parameters to apply to other data
+```
+
+Using the recipe above, we center, normalize, and remove variables which might have absolute correlations in our data. Recipes are a way to keep our data processing steps organized across different workflows.  
+
+Next, we specify the type of model. In this case, we'll be using the randomForest R package to specify the model we want to use.
+```{r, echo=TRUE}
+rf_model <- rand_forest(mode = "regression") %>% 
+  set_engine("randomForest")
+```
+
+There are a variety of parameters we can pass to `rand_forest()`to tune and optimize our model, but for now we will leave them as the default values sans the `mode` parameter, which tells the function that we are conducting a regression (the other parameter we could pass to `mode` is `"classification"`, if that was the type of target feature we would be trying to predict). 
+
+Now, we can create our workflow. The tidymodels documentation sums up workflows really well: a workflow is an object that can bundle together your pre-processing, modeling, and post-processing requests. Below, we set up the workflow to add the Random Forest model and recipe we specified above. 
+```{r, echo=TRUE}
+precovid_wflow <- 
+  workflow() %>% 
+  add_model(rf_model) %>% 
+  add_recipe(precovid_recipe)
+```
+
+Finally, we fit the actual model with the `fit` function, specifying the training dataset. 
+```{r, echo=TRUE}
+precovid_fit <- 
+  precovid_wflow %>% 
+  fit(data = precovid_train)
+```
+
+Now that the Random Forest model has been fitted, we can generate predictions on our holdout dataset (`precovidtest`) to see how the model performed on data it has not seen before. In the next section, we will look at some key metrics to understand the predictive performance of this model.
+```{r, echo=TRUE}
+precovid_results <- precovid_test %>% 
+  select(totaltrips) %>% 
+  bind_cols(predict(precovid_fit, new_data = precovid_test)) %>% 
+  rename(rf_model=.pred)
+```
+
+### XGBoost 
+
+[in progress]
+
+### CatBoost
+
+[in progress]
+
+## Model Evaluation
+
+There are a variety of performance metrics that are commonly employed in a machine learning pipeline. In this project, we will focus on two metrics commonly employed for regression problems: Mean Absolute Error (MAE) and Root Mean Square Error (RMSE). 
+
+#### Mean Absolute Error (MAE)
+
+[explanation and formula for MAE]
+
+#### Root Mean Squared Error (RMSE)
+
+[explanation and formula for RMSE]  
+
+```{r}
+rftable_metrics <- precovid_test %>% 
+  select(GEOID, totaltrips) %>% 
+  bind_cols(predict(precovid_fit, new_data = precovid_test)) %>% 
+  rename(rf_model=.pred) %>% 
+  mutate(totaltrips = 10^totaltrips,
+         rf_model=10^rf_model) %>% 
+  metrics(truth=totaltrips, estimate=rf_model) %>% 
+  rename(metric = .metric,estimate = .estimate) %>% 
+  filter(!metric == 'rsq') %>% 
+  select(-.estimator)
+kable(rftable_metrics, caption="Random Forest Performance Metrics")
+```
+
+The Mean Absolute Error for the Random Forest model is ~45k. In other words, on average, the difference between the actual number of TNC trips and Random Forest predictions is about ~32k trips. This is without including some important variables that are still being collected for this project, including built environment variables, transit supply characteristics, and employment/worker characteristic data. Given that only 13 predictors (all which were related to socioeconomic/demographics) were utilized in the RF model, and the model's parameters have not been modified -- this is a fairly good start. 
+
+Below, we can visualize the accuracy of the RF model with an 'observed vs predicted' plot. 
+```{r, fig.height=6, fig.width=4}
+precovid_results %>% 
+  ggplot(aes(x = rf_model, y = totaltrips)) + 
+  geom_abline(col = "#F8766D", lty = 'solid', size=1.2) + 
+  geom_point(alpha = .4) + 
+  coord_fixed() + 
+  theme_plex() +
+  labs(title = 'Random Forest Model Evaluation',
+       subtitle = "for Pre-COVID trips",
+       x = 'Random Forest Prediction',
+       y = 'Log of Trip Counts')
+```
+<br>
+Overall, the predictions are fairly clustered around the 1:1 line. Based on this plot and the performance metrics discussed above, the RF model performs decently without performing grid search cross validation (CV), which is a tuning technique that calculates the ideal hyperparameters of a model. However, to increase the predictive power of the models in this project, 10-fold CV will be employed. Additional model tuning will be done where necessary for each model, as well. 
+
+## Model Interpretation
+
+The primary purpose of machine learning algorithms is to accurately predict an output given a number of inputs. However, because tree-based ML algorithms derive their predictive power from complex statistical methods, interpreting the results of such an algorithm is slightly more complex than parametric statistical methods like a generalized linear regression. In general, as the flexibility of an algorithm increases (and, therefore its predictive power), the interpretability tends to decrease. However, tree-based models often provide a balance between predictive power and interpretation. 
+
+In this section, we will interpret the models employed for this project through some commonly known methods. 
+
+### Variable Importance
+
+[explain variable importance and how it is calculated]
+
+```{r}
+precovid_fit %>% 
+  extract_fit_parsnip() %>% 
+  vip(num_features=13, geom = "point", aesthetics = list(color="#C77CFF", size=2)) + 
+  theme_plex() +
+  labs(title = 'Variable Importance for Random Forest',
+       x = 'Predictors',
+       y = 'Importance')
+```
+<br>
+
+### Partial Dependence Plot (PDP)
+
+[explain PDP's and how they are calculated]  
+
+```{r, include=FALSE}
+explainer_rf <- explain_tidymodels(
+    precovid_fit, 
+    data = dplyr::select(precovid_train, -totaltrips), 
+    y = precovid_train$totaltrips,
+    label = "random forest"
+)
+
+pdp_rf <- model_profile(explainer_rf, N = NULL, variables = "avgtripdistance_mi")
+```
+
+Below, we plot a PDP for the most important feature in the RF model. 
+```{r}
+as_tibble(pdp_rf$agr_profiles) %>%
+  mutate(`_label_` = stringr::str_remove(`_label_`, "random forest_")) %>%
+  ggplot(aes(`_x_`, `_yhat_`, color = `_label_`)) +
+  geom_line(size = 1.2, alpha = 0.8, color="#F8766D") +
+  theme_plex() + 
+  labs(title = "Partial Dependance Plot for Pre-COVID TNC Trips",
+       subtitle = "Random Forest Model",
+       x = "Average Trip Distance (miles)",
+       y = "TNC Trips (log)")
+```
+<br>
+The RF model predicts that, on average, the number of TNC trips decreases sharply when the distance of the trip is above ~5 miles. This is an expected finding for a travel impedance variable, as longer trips are pricier than shorter ones, thus the demand of TNC increases with shorter trips.
+
+Let's look at a PDP of the second most important feature in our random forest model. 
+
+```{r, include=FALSE}
+explainer_rf <- explain_tidymodels(
+    precovid_fit, 
+    data = dplyr::select(precovid_train, -totaltrips), 
+    y = precovid_train$totaltrips,
+    label = "random forest"
+)
+
+pdp_rf <- model_profile(explainer_rf, N = NULL, variables = "bachelors_rate")
+```
+
+
+```{r}
+as_tibble(pdp_rf$agr_profiles) %>%
+  mutate(`_label_` = stringr::str_remove(`_label_`, "random forest_")) %>%
+  ggplot(aes(`_x_`, `_yhat_`, color = `_label_`)) +
+  geom_line(size = 1.2, alpha = 0.8, color="#00BFC4") +
+  theme_plex() + 
+  labs(title = "Partial Dependance Plot for Pre-COVID TNC Trips",
+       subtitle = "Random Forest Model",
+       x = "Bachelor's Degree Attainment Rate",
+       y = "TNC Trips (log)")
+```
+<br>
+The influence of educational attainment on TNC demand is undeniable. The RF model estimates that, pre-COVID, tracts with a greater population of bachelor's degree holders also had a higher count of TNC trips. Interestingly, we can see that there is a plateau in TNC demand with tracts that have a bachelor's degree rate of 40% or more. We can presume that, despite higher educational attainment, the utility of TNC services reaches a threshold in more educated neighborhoods due to greater accessibility to private automobiles for individuals and families with better jobs and more disposable income.
+
+
+## Future Work
+This preliminary data analysis revealed some important findings of pre-COVID TNC trips in Chicago, and how different socioeconomic groups interacted with TNC services before the pandemic. Using a Random Forest model, we were able to predict TNC trips with a decent degree of accuracy. We were also able to interpret some important findings from the model, particularly with regards to travel impedance and educational attainment features used as predictors in the model. 
+
+For the following semester, the following will be implemented: 
+
+1. Train and test XGBoost and CatBoost models. These are gradient boosted decision tree models, which implement the tree-building process slightly differently from random forest. 
+2. Tune and evaluate all pre-COVID models. 
+3. Find optimal model for pre-COVID trips.
+4. Using optimal model in Step 3, train and test on post-COVID dataset.
+5. Interpret post-COVID model using feature importance, PDP, etc. 
